@@ -47,6 +47,7 @@ class ICTGannScanner:
         # Gann tolerance: ±0.5% 或 ±$250 取較大值（可在 .env 覆寫）
         self.gann_tol_pct     = float(os.getenv('GANN_TOLERANCE_PCT', 0.005))
         self.gann_tol_min     = float(os.getenv('GANN_TOLERANCE_MIN', 250))
+        self.gann_step        = int(os.getenv('GANN_STEP', 5))  # sqrt step: 5 → ~$2700 gap at $77k
 
         # Bollinger Bands
         self.bb_period = 20
@@ -97,14 +98,18 @@ class ICTGannScanner:
     # LAYER 1: GANN LEVELS (Square of 9)
     # ══════════════════════════════════════════════
 
-    def gann_levels(self, price: float, n: int = 20) -> List[float]:
+    def gann_levels(self, price: float, n: int = 10) -> List[float]:
         """
-        Gann Square of 9：整數平方根附近的 n² 數列
-        BTC $77k → sqrt≈277.5 → levels: 268²..288²
+        Gann Square of 9（大間距版）：每 GANN_STEP 個整數取一個 n²
+        step=5 時 BTC $77k 附近層級間距約 $2,700
+        例: 255²=65025, 260²=67600, 265²=70225, 270²=72900,
+            275²=75625, 280²=78400, 285²=81225, 290²=84100
         """
-        base = round(price ** 0.5)
+        base = round(price ** 0.5 / self.gann_step) * self.gann_step
         half = n // 2
-        return [float((base + i) ** 2) for i in range(-half, half + 1) if (base + i) > 0]
+        return [float((base + i * self.gann_step) ** 2)
+                for i in range(-half, half + 1)
+                if (base + i * self.gann_step) > 0]
 
     def nearest_gann(self, price: float, levels: List[float]) -> Tuple[float, float, float]:
         """返回 (最近Gann線, 下方Gann線, 上方Gann線)"""
@@ -143,6 +148,7 @@ class ICTGannScanner:
     def analyze_trend(self, df: pd.DataFrame) -> str:
         """
         分析最近 trend_lookback 根 15min K線
+        要求同時滿足 HH+HL（UP）或 LH+LL（DOWN）才確認趨勢
         返回: 'UP' / 'DOWN' / 'NEUTRAL'
         """
         window = df.tail(self.trend_lookback)
@@ -161,25 +167,12 @@ class ICTGannScanner:
             lh = sh[-1] < sh[-2]
             ll = sl[-1] < sl[-2]
 
+            # 嚴格：必須同時滿足兩個條件
             if hh and hl:
                 return 'UP'
             if lh and ll:
                 return 'DOWN'
-            if hh or hl:
-                return 'UP'
-            if lh or ll:
-                return 'DOWN'
 
-        # Fallback: 前半 vs 後半均價
-        mid = n // 2
-        first_avg  = window.iloc[:mid]['close'].mean()
-        second_avg = window.iloc[mid:]['close'].mean()
-        pct = (second_avg - first_avg) / first_avg
-
-        if pct > 0.003:
-            return 'UP'
-        if pct < -0.003:
-            return 'DOWN'
         return 'NEUTRAL'
 
     def calc_vwap(self, df: pd.DataFrame) -> float:
@@ -215,18 +208,18 @@ class ICTGannScanner:
         return float(c['close']) < float(c['open'])
 
     def is_hammer(self, c) -> bool:
-        """錘頭線：小實體在上，長下影線≥2x實體，上影線≤15%"""
+        """錘頭線：小實體在上，長下影線≥2x實體，上影線≤15%，實體≥最小閾值"""
         b, r = self._body(c), self._rng(c)
-        if r == 0:
+        if r == 0 or b < float(c['close']) * 0.001:  # 實體最少0.1%
             return False
         return (b <= r * 0.35 and
                 self._lower(c) >= b * 2.0 and
                 self._upper(c) <= r * 0.15)
 
     def is_shooting_star(self, c) -> bool:
-        """流星線：小實體在下，長上影線≥2x實體，下影線≤15%"""
+        """流星線：小實體在下，長上影線≥2x實體，下影線≤15%，實體≥最小閾值"""
         b, r = self._body(c), self._rng(c)
-        if r == 0:
+        if r == 0 or b < float(c['close']) * 0.001:  # 實體最少0.1%
             return False
         return (b <= r * 0.35 and
                 self._upper(c) >= b * 2.0 and
@@ -367,6 +360,14 @@ class ICTGannScanner:
         # ── 第三層：K線形態 ──
         pattern = self.detect_pattern(df, trend)
         if pattern is None:
+            return None
+
+        # ── VWAP 方向過濾 ──
+        # 上升趨勢：價格須高於 VWAP（支撐有效）
+        # 下降趨勢：價格須低於 VWAP（阻力有效）
+        if trend == 'UP'   and price < vwap * 0.995:
+            return None
+        if trend == 'DOWN' and price > vwap * 1.005:
             return None
 
         # ── BB 加持 ──
